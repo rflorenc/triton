@@ -104,9 +104,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 
   // Assign stage to each op reachable from a latency op
-  for (auto &kv : distance) {
-    Operation *op = kv.first;
-    int dist = kv.second;
+  for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
     // (had a non-negative distance due to a latency op).
     if (dist >= 0)
