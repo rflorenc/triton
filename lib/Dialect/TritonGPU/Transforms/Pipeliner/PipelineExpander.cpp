@@ -32,6 +32,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 
 #define DEBUG_TYPE "triton-loop-pipelining"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -211,17 +212,6 @@ bool LoopPipelinerInternal::initializeLoopInfo(
   return true;
 }
 
-/// Find operands of all the nested operations within `op`.
-static SetVector<Value> getNestedOperands(Operation *op) {
-  SetVector<Value> operands;
-  op->walk([&](Operation *nestedOp) {
-    for (Value operand : nestedOp->getOperands()) {
-      operands.insert(operand);
-    }
-  });
-  return operands;
-}
-
 /// Compute unrolled cycles of each op (consumer) and verify that each op is
 /// scheduled after its operands (producers) while adjusting for the distance
 /// between producer and consumer.
@@ -248,7 +238,9 @@ bool LoopPipelinerInternal::verifySchedule() {
         continue;
       int64_t producerCycle = it->second;
       if (consumerCycle < producerCycle - numCylesPerIter * distance) {
-        consumer->emitError("operation scheduled before its operands");
+        InFlightDiagnostic diag =
+            consumer->emitError("operation scheduled before its operands");
+        diag.attachNote(producer->getLoc()) << "operand defined here";
         return false;
       }
     }

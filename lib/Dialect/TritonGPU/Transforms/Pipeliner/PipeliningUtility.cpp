@@ -200,6 +200,22 @@ void mlir::triton::replaceUsesAndPropagateType(OpBuilder &builder,
     op->erase();
 }
 
+void mlir::triton::visitNestedOperands(Operation *op,
+                                       function_ref<void(Value)> visitor) {
+  op->walk([&](Operation *nestedOp) {
+    for (Value operand : nestedOp->getOperands()) {
+      if (operand.getParentBlock()->getParentOp()->isProperAncestor(op))
+        visitor(operand);
+    }
+  });
+}
+
+SetVector<Value> mlir::triton::getNestedOperands(Operation *op) {
+  SetVector<Value> result;
+  visitNestedOperands(op, [&](Value operand) { result.insert(operand); });
+  return result;
+}
+
 std::optional<std::pair<int, int>>
 mlir::triton::maybeGetStageCluster(Operation *op) {
   auto stage =

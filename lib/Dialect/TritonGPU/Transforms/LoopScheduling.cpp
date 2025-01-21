@@ -140,16 +140,6 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 void scheduleDistanceOneDependencies(scf::ForOp forOp,
                                      CoarseSchedule &schedule) {
   int numStages = schedule.numStages;
-  auto getNestedOperands = [](Operation *op) -> SmallVector<Value> {
-    SmallVector<Value> operands;
-    op->walk([&](Operation *nestedOp) {
-      for (Value operand : nestedOp->getOperands()) {
-        if (operand.getParentBlock()->getParentOp()->isAncestor(nestedOp))
-          operands.push_back(operand);
-      }
-    });
-    return operands;
-  };
 
   // Mapping from the cluster to the cluster before it.
   DenseMap<CoarseSchedule::Cluster *, CoarseSchedule::Cluster> dist1Cluster;
