@@ -44,6 +44,16 @@ struct LoadInfo {
   bool isMMAv3Registers = false;
   int distToUse = 0;
   bool usedByDot = false;
+
+  LLVM_DUMP_METHOD void dump() const {
+    llvm::dbgs() << "LoadInfo: \n"
+                 << "  sharedEncoding: " << sharedEncoding << "\n"
+                 << "  blockedEncoding: " << blockedEncoding << "\n"
+                 << "  isMMAv3Shared: " << isMMAv3Shared << "\n"
+                 << "  isMMAv3Registers: " << isMMAv3Registers << "\n"
+                 << "  distToUse: " << distToUse << "\n"
+                 << "  usedByDot: " << usedByDot << "\n";
+  }
 };
 
 } // namespace
@@ -120,8 +130,7 @@ static Operation *getFirstUseOfPipelinedLoad(Operation *loadOp) {
 
 static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
                            Value insertIdx, Value extractIdx,
-                           llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
-                           int maxClusterId) {
+                           const LoadInfo &loadInfo, int maxClusterId) {
   int retCode = -1;
   OpBuilderWithStage builder(forOp);
   auto opPair = tt::getStageCluster(loadOp);
@@ -147,10 +156,10 @@ static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
     return cvt.getResult();
   };
 
-  if (!isExpensiveLoadOrStore(loadOp) && loadToInfo[loadOp].blockedEncoding) {
+  if (!isExpensiveLoadOrStore(loadOp) && loadInfo.blockedEncoding) {
     // For inexpensive loads that do not directly feed into dot ops
     // we want to use optimal layout for the data.
-    ttg::BlockedEncodingAttr encoding = loadToInfo[loadOp].blockedEncoding;
+    ttg::BlockedEncodingAttr encoding = loadInfo.blockedEncoding;
     src = convertBlockLayout(src, encoding);
     if (mask)
       mask = convertBlockLayout(mask, encoding);
@@ -176,7 +185,7 @@ static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   Operation *wait = builder.createWithStage<ttg::AsyncWaitOp>(
       loc, stageForFirstUse, clusterForFirstUse, commit->getResult(0), 0);
 
-  auto loadIsMMAv3Shared = loadToInfo[loadOp].isMMAv3Shared;
+  auto loadIsMMAv3Shared = loadInfo.isMMAv3Shared;
 
   // Extract part.
   SmallVector<Value> loadOffsets(allocTy.getRank(), zero);
@@ -219,7 +228,7 @@ static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
     loadOp->replaceAllUsesWith(result);
 
     // Prefetch load if is not MMAV3 and is used by the dot.
-    if (loadToInfo[loadOp].usedByDot) {
+    if (loadInfo.usedByDot) {
       assert(stageForFirstUse >= 1);
       tt::setStageCluster(wait, stageForFirstUse - 1, maxClusterId + 1);
       tt::setStageCluster(viewLoad, stageForFirstUse - 1, maxClusterId + 1);
@@ -230,11 +239,11 @@ static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   return retCode;
 }
 
-static void
-createTMAAsyncCopy(scf::ForOp &forOp, tt::ExperimentalDescriptorLoadOp loadOp,
-                   Value alloc, Value insertIdx, Value extractIdx,
-                   Value barrier, Operation *waitOp, Value phase,
-                   llvm::MapVector<Operation *, LoadInfo> &loadToInfo) {
+static void createTMAAsyncCopy(scf::ForOp &forOp,
+                               tt::ExperimentalDescriptorLoadOp loadOp,
+                               Value alloc, Value insertIdx, Value extractIdx,
+                               Value barrier, Operation *waitOp, Value phase,
+                               const LoadInfo &loadInfo) {
   assert(phase && "Phase value is required for TMA async copy.");
   OpBuilderWithStage builder(forOp);
   auto [stage, clusterId] = tt::getStageCluster(loadOp);
@@ -265,7 +274,7 @@ createTMAAsyncCopy(scf::ForOp &forOp, tt::ExperimentalDescriptorLoadOp loadOp,
   Operation *copy = builder.createWithStage<ttng::AsyncTMACopyGlobalToLocalOp>(
       loc, stage, clusterId, tmaPtr, loadOp.getIndices(), barrier, view, pred);
 
-  auto loadIsMMAv3Shared = loadToInfo[loadOp].isMMAv3Shared;
+  auto loadIsMMAv3Shared = loadInfo.isMMAv3Shared;
 
   builder.setInsertionPointAfter(waitOp);
   // Extract part.
@@ -1006,14 +1015,15 @@ createAsyncOps(scf::ForOp &forOp,
   auto [_, maxClusterId] = tt::getMinMaxCluster(forOp);
   for (AsyncLoad &asyncLoad : asyncLoads) {
     auto [insertIdx, extractIdx, phase, _] = stageGroups[asyncLoad.numBuffers];
+    const LoadInfo &loadInfo = loadToInfo[asyncLoad.loadOp];
     if (auto loadOp = dyn_cast<tt::LoadOp>(asyncLoad.loadOp)) {
       createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
-                      loadToInfo, maxClusterId);
+                      loadInfo, maxClusterId);
     } else {
       auto descLoad = cast<tt::ExperimentalDescriptorLoadOp>(asyncLoad.loadOp);
       createTMAAsyncCopy(forOp, descLoad, asyncLoad.alloc, insertIdx,
                          extractIdx, asyncLoad.barrier, asyncLoad.waitOp, phase,
-                         loadToInfo);
+                         loadInfo);
     }
   }
   // Patch the yield with the updated counters. Subtract to account for the loop

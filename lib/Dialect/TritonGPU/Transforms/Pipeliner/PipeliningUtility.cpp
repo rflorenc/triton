@@ -218,10 +218,8 @@ SetVector<Value> mlir::triton::getNestedOperands(Operation *op) {
 
 std::optional<std::pair<int, int>>
 mlir::triton::maybeGetStageCluster(Operation *op) {
-  auto stage =
-      dyn_cast_if_present<IntegerAttr>(op->getAttr(tt::kLoopStageAttrName));
-  auto clusterId =
-      dyn_cast_if_present<IntegerAttr>(op->getAttr(tt::kLoopClusterAttrName));
+  auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+  auto clusterId = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
   if (!stage || !clusterId) {
     return std::nullopt;
   }

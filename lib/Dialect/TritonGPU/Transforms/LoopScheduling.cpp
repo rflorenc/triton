@@ -206,7 +206,7 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
   if (!ifsToStage.empty()) {
     CoarseSchedule::Cluster prologueCluster = schedule.clusters.newAtFront();
     for (auto [ifOp, stage] : ifsToStage) {
-      schedule.insert(ifOp, stage, prologueCluster);
+      schedule.insertIfAbsent(ifOp, stage, prologueCluster);
     }
   }
 
