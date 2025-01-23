@@ -49,6 +49,18 @@ std::pair<int, int> getMinMaxCluster(scf::ForOp &forOp);
 std::pair<int, int> getStageCluster(Operation *op);
 std::optional<std::pair<int, int>> maybeGetStageCluster(Operation *op);
 void setStageCluster(Operation *op, int stage, int cluster);
+
+class ConditionalLoadOp : public scf::IfOp {
+public:
+  static constexpr llvm::StringLiteral kMarkerAttr = "ttg.conditional_load";
+
+  using IfOp::IfOp;
+
+  static bool classof(Operation *op);
+
+  Operation *getInnerLoad();
+};
+
 } // namespace triton
 } // namespace mlir
 

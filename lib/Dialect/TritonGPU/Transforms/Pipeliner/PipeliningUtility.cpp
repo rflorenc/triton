@@ -258,3 +258,38 @@ std::pair<int, int> mlir::triton::getMinMaxCluster(scf::ForOp &forOp) {
   }
   return std::make_pair(minClusterId, maxClusterId);
 }
+
+bool tt::ConditionalLoadOp::classof(Operation *op) {
+  auto ifOp = dyn_cast<scf::IfOp>(op);
+  if (!ifOp)
+    return false;
+
+  if (auto marker = ifOp->getAttrOfType<BoolAttr>(kMarkerAttr))
+    return marker.getValue();
+
+  unsigned numLoads = 0;
+  ifOp.walk([&](Operation *op) {
+    numLoads += isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op);
+    if (numLoads > 1)
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  // Cache the result.
+  bool isConditionalLoad = numLoads == 1;
+  ifOp->setAttr(kMarkerAttr,
+                BoolAttr::get(ifOp->getContext(), isConditionalLoad));
+  return isConditionalLoad;
+}
+
+Operation *tt::ConditionalLoadOp::getInnerLoad() {
+  Operation *innerLoad = nullptr;
+  walk([&](Operation *op) {
+    if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op)) {
+      innerLoad = op;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  assert(innerLoad && "classof invariant violated");
+  return innerLoad;
+}

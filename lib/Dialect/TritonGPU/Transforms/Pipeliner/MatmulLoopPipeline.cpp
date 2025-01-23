@@ -1,5 +1,6 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -308,6 +309,147 @@ static void createTMAAsyncCopy(scf::ForOp &forOp,
   loadOp.erase();
 }
 
+static void splitIntoClusters(scf::IfOp ifOp) {
+  struct Cluster {
+    SmallVector<Operation *> ops;
+    OwningOpRef<tt::FuncOp> container;
+    SetVector<Value> outputs;
+  };
+
+  llvm::SmallMapVector<int, Cluster, 4> clusterToRegion;
+  llvm::SmallDenseMap<int, int> clusterToStage;
+
+  // Group the ops into clusters.
+  for (Operation &op : ifOp.getThenRegion().front().without_terminator()) {
+    auto [stage, clusterId] = tt::getStageCluster(&op);
+    clusterToStage[clusterId] = stage;
+    clusterToRegion[clusterId].ops.push_back(&op);
+  }
+
+  // Now move the ops into temporary containers, separating them from the
+  // original if.
+  Location loc = ifOp.getLoc();
+  for (Cluster &cluster : llvm::make_second_range(clusterToRegion)) {
+    OperationState state(loc, tt::FuncOp::getOperationName());
+    Region &region = *state.addRegion();
+    region.push_back(new Block);
+    Block &block = region.front();
+    for (Operation *op : cluster.ops)
+      op->moveBefore(&block, block.end());
+    cluster.container = cast<tt::FuncOp>(Operation::create(state));
+  }
+
+  // Now that the ops have been separated, we can compute the cluster outputs.
+  SmallVector<scf::IfOp> ifOps{ifOp};
+  for (auto &[clusterId, cluster] : clusterToRegion) {
+    Region &region = cluster.container->getBody();
+    for (Operation *op : cluster.ops) {
+      for (Value result : op->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (!region.isAncestor(user->getParentRegion())) {
+            cluster.outputs.insert(result);
+          }
+        }
+      }
+    }
+
+    // Move all the ops into a new if.
+    OpBuilderWithStage builder(ifOp);
+    int stage = clusterToStage[clusterId];
+    auto splitIf = builder.createWithStage<scf::IfOp>(
+        loc, stage, clusterId,
+        ValueRange(cluster.outputs.getArrayRef()).getTypes(),
+        ifOp.getCondition());
+    ifOps.push_back(splitIf);
+    splitIf.getThenRegion().takeBody(region);
+    builder.setInsertionPointToEnd(&splitIf.getThenRegion().front());
+    builder.create<scf::YieldOp>(loc, cluster.outputs.getArrayRef());
+
+    // In the else branch, return undef values since they will never be
+    // accessed.
+    builder.createBlock(&splitIf.getElseRegion());
+    SmallVector<Value> undefs(cluster.outputs.size());
+    for (auto [undef, output] : llvm::zip(undefs, cluster.outputs))
+      undef = builder.create<ub::PoisonOp>(loc, output.getType());
+    builder.create<scf::YieldOp>(loc, undefs);
+
+    // Replace the outputs of the cluster with the results of the new if.
+    for (auto [i, output] : llvm::enumerate(cluster.outputs)) {
+      Value(output).replaceUsesWithIf(
+          splitIf.getResult(i), [&](OpOperand &use) {
+            return !splitIf.getThenRegion().isAncestor(
+                use.getOwner()->getParentRegion());
+          });
+    }
+  }
+
+  for (scf::IfOp ifOp : ifOps) {
+    ifOp.getThenRegion().walk([](Operation *op) {
+      op->removeAttr(tt::kLoopStageAttrName);
+      op->removeAttr(tt::kLoopClusterAttrName);
+    });
+  }
+  ifOp->removeAttr(tt::ConditionalLoadOp::kMarkerAttr);
+}
+
+static void createConditionalAsyncCopy(scf::ForOp &forOp,
+                                       tt::ConditionalLoadOp ifOp, Value alloc,
+                                       Value insertIdx, Value extractIdx,
+                                       Value barrier, Operation *waitOp,
+                                       Value phase, const LoadInfo &loadInfo,
+                                       int maxClusterId) {
+  Operation *firstUse = getFirstUseOfPipelinedLoad(ifOp);
+  auto [stage, clusterId] = tt::getStageCluster(ifOp);
+  auto [stageForFirstUse, clusterForFirstUse] = tt::getStageCluster(firstUse);
+  ifOp.dump();
+
+  // Put the load always in the then region.
+  Operation *innerLoad = ifOp.getInnerLoad();
+  if (innerLoad->getParentRegion() == &ifOp.getElseRegion()) {
+    Location loc = ifOp.getLoc();
+    OpBuilderWithStage builder(ifOp);
+    Value inverted = builder.createWithStage<arith::XOrIOp>(
+        loc, stage, clusterId, ifOp.getCondition(),
+        builder.createWithStage<arith::ConstantIntOp>(loc, stage, clusterId, 1,
+                                                      1));
+    scf::IfOp newIfOp = builder.createWithStage<scf::IfOp>(
+        loc, stage, clusterId, ifOp.getResultTypes(), inverted);
+    newIfOp.getThenRegion().takeBody(ifOp.getElseRegion());
+    newIfOp.getElseRegion().takeBody(ifOp.getThenRegion());
+    ifOp.replaceAllUsesWith(newIfOp.getResults());
+    ifOp.erase();
+    ifOp = cast<tt::ConditionalLoadOp>(*newIfOp);
+  }
+  assert(innerLoad->getParentRegion() == &ifOp.getThenRegion());
+
+  // Assign all ops up to the inner load to the same stage and cluster as the
+  // if, and all ops afterwards to the stage and cluster of the first use.
+  Block &block = ifOp.getThenRegion().front();
+  auto midIt = std::next(innerLoad->getIterator());
+  for (Operation &op : llvm::make_range(block.begin(), midIt))
+    tt::setStageCluster(&op, stage, clusterId);
+  for (Operation &op : llvm::make_range(midIt, block.end()))
+    tt::setStageCluster(&op, stageForFirstUse, clusterForFirstUse);
+
+  loadInfo.dump();
+  if (auto loadOp = dyn_cast<tt::LoadOp>(innerLoad)) {
+    createAsyncCopy(forOp, loadOp, alloc, insertIdx, extractIdx, loadInfo,
+                    maxClusterId);
+  } else if (auto loadOp =
+                 dyn_cast<tt::ExperimentalDescriptorLoadOp>(innerLoad)) {
+    createTMAAsyncCopy(forOp, loadOp, alloc, insertIdx, extractIdx, barrier,
+                       waitOp, phase, loadInfo);
+  } else {
+    llvm_unreachable("unexpected load op");
+  }
+
+  // Split the if into clusters.
+  ifOp.dump();
+  splitIntoClusters(ifOp);
+  tt::setStageCluster(ifOp, stageForFirstUse, clusterForFirstUse);
+  ifOp->getParentOp()->dump();
+}
+
 static ttg::BlockedEncodingAttr
 getBlockedEncoding(tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfo) {
   Value src = loadOp.getPtr();
@@ -432,7 +574,8 @@ getTransitiveUserInBlock(Operation *baseOp, scf::ForOp &forOp) {
             users.push_back(op);
             return;
           }
-          if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op) ||
+          if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp,
+                  tt::ConditionalLoadOp>(op) ||
               op->hasTrait<OpTrait::DotLike>()) {
             // Stop recursion when hitting a LoadOp or a DotOp.
             users.push_back(op);
@@ -463,7 +606,8 @@ assignMemoryLayouts(scf::ForOp &forOp,
   // Go through all loads in the loop, check to see if they are pipelined.
   llvm::DenseSet<Operation *> loadsToPipeline;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (!isa<tt::LoadOp>(op) && !isa<tt::ExperimentalDescriptorLoadOp>(op))
+    if (!isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp,
+             tt::ConditionalLoadOp>(op))
       continue;
     if (loadToInfo.count(&op))
       // TODO pawel: err, we'd need to verify that the distance is the same
@@ -531,9 +675,15 @@ assignMemoryLayouts(scf::ForOp &forOp,
         LDBG("try generic shared encoding");
         loadInfo.sharedEncoding =
             getSharedEncoding(&op, isTMALoad).value_or(nullptr);
-        if (auto loadOp = dyn_cast<tt::LoadOp>(op))
+        if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
           loadInfo.blockedEncoding =
               getBlockedEncoding(loadOp, axisInfoAnalysis);
+        } else if (auto condLoadOp = dyn_cast<tt::ConditionalLoadOp>(op)) {
+          if (auto loadOp = dyn_cast<tt::LoadOp>(condLoadOp.getInnerLoad())) {
+            loadInfo.blockedEncoding =
+                getBlockedEncoding(loadOp, axisInfoAnalysis);
+          }
+        }
       }
     }
     loadToInfo[&op] = loadInfo;
@@ -1019,11 +1169,16 @@ createAsyncOps(scf::ForOp &forOp,
     if (auto loadOp = dyn_cast<tt::LoadOp>(asyncLoad.loadOp)) {
       createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
                       loadInfo, maxClusterId);
-    } else {
-      auto descLoad = cast<tt::ExperimentalDescriptorLoadOp>(asyncLoad.loadOp);
+    } else if (auto descLoad = dyn_cast<tt::ExperimentalDescriptorLoadOp>(
+                   asyncLoad.loadOp)) {
       createTMAAsyncCopy(forOp, descLoad, asyncLoad.alloc, insertIdx,
                          extractIdx, asyncLoad.barrier, asyncLoad.waitOp, phase,
                          loadInfo);
+    } else {
+      createConditionalAsyncCopy(
+          forOp, cast<tt::ConditionalLoadOp>(asyncLoad.loadOp), asyncLoad.alloc,
+          insertIdx, extractIdx, asyncLoad.barrier, asyncLoad.waitOp, phase,
+          loadInfo, maxClusterId);
     }
   }
   // Patch the yield with the updated counters. Subtract to account for the loop
@@ -1190,7 +1345,15 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
 
   if (waitOp->getNumOperands() != 1)
     return 0;
-  int minCommits = minOverHistories(waitOp->getOperand(0), waitOp, 0);
+  Value val = waitOp->getOperand(0);
+  // If the value resides in a region other than the region of the wait op, then
+  // the wait op must be in some nested region. Measure the number of commits
+  // between the definition value and the parent op.
+  // TODO: We could measure commits in nested regions along the path if
+  // necessary.
+  while (waitOp->getParentRegion() != val.getParentRegion())
+    waitOp = waitOp->getParentOp();
+  int minCommits = minOverHistories(val, waitOp, 0);
   return minCommits;
 }
 
