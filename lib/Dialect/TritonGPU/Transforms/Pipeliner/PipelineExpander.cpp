@@ -241,6 +241,7 @@ bool LoopPipelinerInternal::verifySchedule() {
         InFlightDiagnostic diag =
             consumer->emitError("operation scheduled before its operands");
         diag.attachNote(producer->getLoc()) << "operand defined here";
+        diag.attachNote(producer->getLoc()) << *producer;
         return false;
       }
     }
