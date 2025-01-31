@@ -99,7 +99,8 @@ bool isPipeliningBeneficial(Operation *op, Operation *finalUser,
       return false;
     }
   }
-  if (isa<tt::ExperimentalDescriptorLoadOp>(op))
+  if (isa<tt::ExperimentalDescriptorLoadOp, tt::ExperimentalDescriptorGatherOp>(
+          op))
     return true;
   if (isa<ttng::WarpGroupDotOp>(finalUser) &&
       getMMALoadType(op) == MMALoadType::DoNotPipeline) {
@@ -130,7 +131,8 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
         if (!seen.insert(op).second || excluded.count(op))
           return;
         if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp,
-                tt::ConditionalLoadOp>(op)) {
+                tt::ExperimentalDescriptorGatherOp, tt::ConditionalLoadOp>(
+                op)) {
           if (!isPipeliningBeneficial(op, finalUser, axisInfoAnalysis))
             return;
           if (loadOpToIndLevel.count(op)) {
@@ -181,7 +183,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
   if (pipelineWithoutDot && !seenDot) {
     for (Operation &op : forOp.getBody()->without_terminator()) {
       if (!isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp,
-               tt::ConditionalLoadOp>(op))
+               tt::ExperimentalDescriptorGatherOp, tt::ConditionalLoadOp>(op))
         dfs(&op, &op, 0);
     }
   }
