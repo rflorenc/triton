@@ -123,7 +123,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
   for (auto [op, stage] : opToStage) {
-    if (isa<scf::IfOp>(op) && !isa<tt::ConditionalLoadOp>(op)) {
+    if (isa<scf::IfOp>(op)) {
       schedule.insert(op, stage, epilogue);
       continue;
     }
@@ -155,7 +155,7 @@ void scheduleDistanceOneDependencies(scf::ForOp forOp,
           Value v = yieldOp->getOperand(arg.getArgNumber() - 1);
           Operation *defOp = v.getDefiningOp();
           if (defOp && schedule.count(defOp) == 0) {
-            if (isa<tt::LoadOp, tt::ConditionalLoadOp>(defOp)) {
+            if (isa<tt::LoadOp>(defOp)) {
               // Exception: Schedule loads with a distance of 1 together
               // with the current op.
               schedule.insertIfAbsent(defOp, stage, cluster);
