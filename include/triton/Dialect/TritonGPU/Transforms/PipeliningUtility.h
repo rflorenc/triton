@@ -49,7 +49,6 @@ std::pair<int, int> getMinMaxCluster(scf::ForOp &forOp);
 std::pair<int, int> getStageCluster(Operation *op);
 std::optional<std::pair<int, int>> maybeGetStageCluster(Operation *op);
 void setStageCluster(Operation *op, int stage, int cluster);
-
 } // namespace triton
 } // namespace mlir
 

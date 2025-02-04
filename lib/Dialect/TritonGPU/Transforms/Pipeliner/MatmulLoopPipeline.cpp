@@ -620,10 +620,9 @@ assignMemoryLayouts(scf::ForOp &forOp,
         if (isa<ttng::TCGen5MMAScaledOp>(use)) {
           loadInfo.isMMAv5Scale = true;
         }
-        if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
+        if (auto loadOp = dyn_cast<tt::LoadOp>(op))
           loadInfo.blockedEncoding =
               getBlockedEncoding(loadOp, axisInfoAnalysis);
-        }
       }
     }
     loadToInfo[&op] = loadInfo;
