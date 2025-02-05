@@ -132,12 +132,14 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     auto ifOp = dyn_cast<scf::IfOp>(op);
     if (!ifOp)
       continue;
+    // If the `scf.if` op itself is a latency op, skip it.
+    if (opLatency.contains(ifOp))
+      continue;
     // Ensure this does not create scheduling conflicts by ensuring the forward
-    // slice of the `scf.if` does not contain ops that are already scheduled.
+    // slice of the `scf.if` does not contain ops that are already scheduled, as
+    // this will cause the `scf.if` to be scheduled before its dependents.
     SetVector<Operation *> slice;
-    ForwardSliceOptions opts;
-    opts.inclusive = true;
-    getForwardSlice(ifOp, &slice, opts);
+    getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
       continue;
     schedule.insert(ifOp, stage, epilogue);
