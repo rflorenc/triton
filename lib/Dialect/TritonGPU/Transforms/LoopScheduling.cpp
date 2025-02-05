@@ -137,7 +137,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
       continue;
     // Ensure this does not create scheduling conflicts by ensuring the forward
     // slice of the `scf.if` does not contain ops that are already scheduled, as
-    // this will cause the `scf.if` to be scheduled before its dependents.
+    // this will cause the `scf.if` to be scheduled after its dependents.
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
