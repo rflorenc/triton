@@ -118,16 +118,29 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   for (int i = 0; i <= maxStage; i++) {
     clusters[i] = schedule.clusters.newAtBack();
   }
-  CoarseSchedule::Cluster epilogue = schedule.clusters.newAtBack();
   // Assign ops to the clusters in reverse-stage order;
   // ops with higher stage numbers are assigned first. This way we will
   // end up with roughly reverse program order in the clusters.
-  for (auto [op, stage] : opToStage) {
-    if (isa<scf::IfOp>(op)) {
-      schedule.insert(op, stage, epilogue);
-      continue;
-    }
+  for (auto [op, stage] : opToStage)
     schedule.insert(op, stage, clusters[maxStage - stage]);
+
+  // Move `scf.if` ops in the current schedule (forward slice of the latency
+  // ops) into a new epilogue cluster at the end of the schedule, pushing them
+  // as close to the end of the loop body as possible.
+  CoarseSchedule::Cluster epilogue = schedule.clusters.newAtBack();
+  for (auto [op, stage] : opToStage) {
+    auto ifOp = dyn_cast<scf::IfOp>(op);
+    if (!ifOp)
+      continue;
+    // Ensure this does not create scheduling conflicts by ensuring the forward
+    // slice of the `scf.if` does not contain ops that are already scheduled.
+    SetVector<Operation *> slice;
+    ForwardSliceOptions opts;
+    opts.inclusive = true;
+    getForwardSlice(ifOp, &slice, opts);
+    if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
+      continue;
+    schedule.insert(ifOp, stage, epilogue);
   }
 
   return schedule;
@@ -194,6 +207,7 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
       SetVector<Operation *> backwardSlice;
       BackwardSliceOptions opt;
       opt.omitBlockArguments = true;
+      opt.omitUsesFromAbove = false;
       getBackwardSlice((Operation *)op, &backwardSlice, opt);
 
       for (auto op : backwardSlice) {

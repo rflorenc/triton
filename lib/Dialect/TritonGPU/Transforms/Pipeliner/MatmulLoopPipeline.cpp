@@ -193,7 +193,7 @@ static int createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   auto viewLoad = builder.createWithStage<ttg::MemDescSubviewOp>(
       loc, stageForFirstUse, clusterForFirstUse, subviewTy, alloc, loadOffsets);
 
-  if (loadToInfo[loadOp].isMMAv3Shared || loadToInfo[loadOp].isMMAv5Scale) {
+  if (loadInfo.isMMAv3Shared || loadInfo.isMMAv5Scale) {
     auto user = *loadOp->getUsers().begin();
     assert(isa<triton::gpu::LocalAllocOp>(user) &&
            "Loading of MMAv3 operands and MMAv5 scale is expected to be "
@@ -343,88 +343,6 @@ static void createTMAAsyncGather(scf::ForOp forOp,
             gatherOp.getLoc(), stage, clusterId, tmaPtr, gatherOp.getXOffsets(),
             gatherOp.getYOffset(), barrier, view, pred);
       });
-}
-
-static void splitIntoClusters(scf::IfOp ifOp) {
-  struct Cluster {
-    SmallVector<Operation *> ops;
-    OwningOpRef<tt::FuncOp> container;
-    SetVector<Value> outputs;
-  };
-
-  llvm::SmallMapVector<int, Cluster, 4> clusterToRegion;
-  llvm::SmallDenseMap<int, int> clusterToStage;
-
-  // Group the ops into clusters.
-  for (Operation &op : ifOp.getThenRegion().front().without_terminator()) {
-    auto [stage, clusterId] = tt::getStageCluster(&op);
-    clusterToStage[clusterId] = stage;
-    clusterToRegion[clusterId].ops.push_back(&op);
-  }
-
-  // Now move the ops into temporary containers, separating them from the
-  // original if.
-  Location loc = ifOp.getLoc();
-  for (Cluster &cluster : llvm::make_second_range(clusterToRegion)) {
-    OperationState state(loc, tt::FuncOp::getOperationName());
-    Region &region = *state.addRegion();
-    region.push_back(new Block);
-    Block &block = region.front();
-    for (Operation *op : cluster.ops)
-      op->moveBefore(&block, block.end());
-    cluster.container = cast<tt::FuncOp>(Operation::create(state));
-  }
-
-  // Now that the ops have been separated, we can compute the cluster outputs.
-  SmallVector<scf::IfOp> ifOps{ifOp};
-  for (auto &[clusterId, cluster] : clusterToRegion) {
-    Region &region = cluster.container->getBody();
-    for (Operation *op : cluster.ops) {
-      for (Value result : op->getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (!region.isAncestor(user->getParentRegion())) {
-            cluster.outputs.insert(result);
-          }
-        }
-      }
-    }
-
-    // Move all the ops into a new if.
-    OpBuilderWithStage builder(ifOp);
-    int stage = clusterToStage[clusterId];
-    auto splitIf = builder.createWithStage<scf::IfOp>(
-        loc, stage, clusterId,
-        ValueRange(cluster.outputs.getArrayRef()).getTypes(),
-        ifOp.getCondition());
-    ifOps.push_back(splitIf);
-    splitIf.getThenRegion().takeBody(region);
-    builder.setInsertionPointToEnd(&splitIf.getThenRegion().front());
-    builder.create<scf::YieldOp>(loc, cluster.outputs.getArrayRef());
-
-    // In the else branch, return undef values since they will never be
-    // accessed.
-    builder.createBlock(&splitIf.getElseRegion());
-    SmallVector<Value> undefs(cluster.outputs.size());
-    for (auto [undef, output] : llvm::zip(undefs, cluster.outputs))
-      undef = builder.create<ub::PoisonOp>(loc, output.getType());
-    builder.create<scf::YieldOp>(loc, undefs);
-
-    // Replace the outputs of the cluster with the results of the new if.
-    for (auto [i, output] : llvm::enumerate(cluster.outputs)) {
-      Value(output).replaceUsesWithIf(
-          splitIf.getResult(i), [&](OpOperand &use) {
-            return !splitIf.getThenRegion().isAncestor(
-                use.getOwner()->getParentRegion());
-          });
-    }
-  }
-
-  for (scf::IfOp ifOp : ifOps) {
-    ifOp.getThenRegion().walk([](Operation *op) {
-      op->removeAttr(tt::kLoopStageAttrName);
-      op->removeAttr(tt::kLoopClusterAttrName);
-    });
-  }
 }
 
 static ttg::BlockedEncodingAttr
