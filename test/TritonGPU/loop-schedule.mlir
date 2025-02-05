@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file -tritongpu-loop-scheduling=num-stages=3 | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-loop-scheduling=num-stages=3 | FileCheck %s
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -58,4 +58,38 @@ tt.func @matmul_loop_load_acc(%lb : index, %ub : index, %step : index,
   }
   tt.return %loop#3: tensor<128x128xf32, #C>
 }
+}
+
+// -----
+
+// CHECK-LABEL: @prologue_backward_slice
+tt.func @prologue_backward_slice(%ub: i32, %cond: i1) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+
+  // CHECK: scf.for
+  scf.for %i = %c0_i32 to %ub step %c1_i32 : i32 {
+    // CHECK: scf.if
+    %0 = scf.if %cond -> i32 {
+      scf.yield %c0_i32 : i32
+    } else {
+      scf.yield %c1_i32 : i32
+    }
+    // CHECK: loop.cluster = 0 : i32, loop.stage = 0 : i32
+
+    // CHECK: op.with_region
+    %1 = "op.with_region"() ({
+      "use"(%0) : (i32) -> ()
+    }) : () -> i32
+    // CHECK: loop.cluster = 1 : i32, loop.stage = 0 : i32
+
+    // CHECK: op.with_region
+    "op.with_region"() ({
+      "use"(%1) : (i32) -> ()
+    }) {tt_latency = 2 : i32} : () -> ()
+    // CHECK: loop.cluster = 1 : i32, loop.stage = 0 : i32
+
+  } {tt.num_stages = 3 : i32}
+
+  tt.return
 }
