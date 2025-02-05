@@ -120,3 +120,27 @@ tt.func @epilogue_forward_slice(%ub: i32, %cond: i1) {
 
   tt.return
 }
+
+// -----
+
+// CHECK-LABEL: @prologue_latency
+tt.func @prologue_latency(%ub: i32, %cond: i1) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+
+  // CHECK: scf.for
+  scf.for %i = %c0_i32 to %ub step %c1_i32 : i32 {
+    // CHECK: "some.op"() {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+    %0 = "some.op"() : () -> i32
+    // CHECK: scf.if
+    %1 = scf.if %cond -> i32 {
+      scf.yield %0 : i32
+    } else {
+      scf.yield %c0_i32 : i32
+    } {tt_latency = 2 : i32}
+    // CHECK: loop.cluster = 0 : i32, loop.stage = 0 : i32
+
+  } {tt.num_stages = 3 : i32}
+
+  tt.return
+}
